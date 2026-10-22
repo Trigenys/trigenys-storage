@@ -1,0 +1,23 @@
+{
+  "name": "trigenys-storage-api",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "r2_buckets": [
+    {
+      "binding": "MEDIA_BUCKET",
+      "bucket_name": "trigenys-storage-media"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "trigenys-storage-registry",
+      "database_id": "3435b033-a015-41b7-bcdb-2bb51ac634e1",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
