@@ -61,7 +61,9 @@ export async function equalSecrets(a: string, b: string): Promise<boolean> {
   if (typeof a !== "string" || typeof b !== "string" || !a || !b) return false;
   const ah = await crypto.subtle.digest("SHA-256", textEncoder.encode(a));
   const bh = await crypto.subtle.digest("SHA-256", textEncoder.encode(b));
-  return new Uint8Array(ah).every((v, i) => v === new Uint8Array(bh)[i]);
+  const left = new Uint8Array(ah); const right = new Uint8Array(bh);
+  let diff = 0; for (let i=0; i<left.length; i++) diff |= left[i] ^ right[i];
+  return diff === 0;
 }
 export async function signToken(claims: TokenClaims, secret: string): Promise<string> {
   const payload = encode(textEncoder.encode(JSON.stringify(claims)));
@@ -108,6 +110,25 @@ async function authorize(request: Request, env: Env): Promise<Response> {
   return json({token,mediaId:claims.id,uploadUrl:"/v1/uploads/"+tenant+"/"+claims.id,
     mediaUrl:"/v1/media/"+tenant+"/"+claims.id,expiresAt:new Date(claims.exp*1000).toISOString()},201);
 }
+async function readLimited(request: Request, limit: number): Promise<Uint8Array | null> {
+  if (!request.body) return null;
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      length += next.value.byteLength;
+      if (length > limit) { await reader.cancel().catch(()=>{}); return null; }
+      chunks.push(next.value);
+    }
+  } catch { await reader.cancel().catch(()=>{}); return null; }
+  const all = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { all.set(chunk,offset); offset += chunk.byteLength; }
+  return all;
+}
 async function upload(request: Request, env: Env, tenant: string, id: string): Promise<Response> {
   const auth = /^Bearer ([A-Za-z0-9_.-]+)$/.exec(request.headers.get("authorization") || "");
   const claims = auth ? await verifyToken(auth[1],env.TOKEN_SIGNING_SECRET || "") : null;
@@ -116,9 +137,10 @@ async function upload(request: Request, env: Env, tenant: string, id: string): P
   if (request.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "image/webp") return fail("UNSUPPORTED_MEDIA_TYPE",415);
   const declared = Number(request.headers.get("content-length") || "0");
   if (declared > claims.maxBytes) return fail("REQUEST_TOO_LARGE",413);
-  const buffer = await request.arrayBuffer();
-  if (buffer.byteLength > claims.maxBytes || buffer.byteLength === 0) return fail("REQUEST_TOO_LARGE",413);
-  if (!isWebP(new Uint8Array(buffer))) return fail("INVALID_WEBP",415);
+  const bytes = await readLimited(request, claims.maxBytes);
+  if (!bytes || bytes.byteLength === 0) return fail("REQUEST_TOO_LARGE",413);
+  if (!isWebP(bytes)) return fail("INVALID_WEBP",415);
+  const buffer = bytes.buffer as ArrayBuffer;
   const key = "tenants/"+tenant+"/"+claims.folder+"/"+claims.id+".webp";
   const inserted = await env.DB.prepare(
     "INSERT OR IGNORE INTO media(id, tenant, folder, object_key, status, visibility, content_type, size_bytes, created_at) VALUES(?, ?, ?, ?, 'pending', 'public', 'image/webp', ?, datetime('now'))"
