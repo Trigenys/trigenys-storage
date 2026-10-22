@@ -1,0 +1,10 @@
+{
+  "repository": "Trigenys/trigenys-storage",
+  "runtime": "typescript-wrangler",
+  "environment": "production",
+  "workerName": "trigenys-storage-api",
+  "rootDirectory": "/backend",
+  "r2": {
+    "recipe": "private-media"
+  }
+}
