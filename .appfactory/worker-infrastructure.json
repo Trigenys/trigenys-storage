@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "provider": "cloudflare-workers-builds",
+  "repository": "Trigenys/trigenys-storage",
+  "workerName": "trigenys-storage-api",
+  "runtime": "typescript-wrangler",
+  "rootDirectory": "/backend",
+  "buildCommand": "npm install --ignore-scripts --no-audit --no-fund && npm run check",
+  "deployCommand": "./node_modules/.bin/wrangler deploy --config wrangler.production.jsonc --keep-vars",
+  "r2Recipe": "private-media"
+}
