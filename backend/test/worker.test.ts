@@ -104,7 +104,7 @@ test("valid authorize-upload-read, repeat upload denied and tenant isolation",as
   assert.equal(authorized.status,201);
   const data=await authorized.json() as {mediaId:string;token:string;uploadUrl:string;mediaUrl:string};
   const bytes=webp();
-  const request = (token=data.token, route=data.uploadUrl, body:BodyInit=bytes) =>
+  const request = (token=data.token, route=data.uploadUrl, body:BodyInit=bytes.buffer as ArrayBuffer) =>
     new Request(origin+route,{method:"PUT",headers:{authorization:"Bearer "+token,"content-type":"image/webp"},body});
   const first=await worker.fetch(request(),env);
   assert.equal(first.status,201);
@@ -128,7 +128,7 @@ test("invalid bytes, over-limit and missing authorization never publish media",a
     body:new Uint8Array([0,1,2])}),env);
   assert.equal(bad.status,415);
   const denied=await worker.fetch(new Request(origin+data.uploadUrl,{method:"PUT",
-    headers:{"content-type":"image/webp"},body:webp()}),env);
+    headers:{"content-type":"image/webp"},body:webp().buffer as ArrayBuffer}),env);
   assert.equal(denied.status,401);
   const before=await worker.fetch(new Request(origin+data.mediaUrl),env);
   assert.equal(before.status,404);
