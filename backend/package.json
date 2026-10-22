@@ -1,0 +1,18 @@
+{
+  "name": "@trigenys/storage-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "npm run typecheck && npm test",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "build": "tsc --noEmit",
+    "deploy": "wrangler deploy --config wrangler.production.jsonc"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0",
+    "wrangler": "^4.0.0"
+  }
+}
