@@ -96,6 +96,7 @@ test("default deny and no tenant secret exposed", async()=>{
   assert.equal((await intent(env,"example",alphaSecret)).status,401);
   const health = await worker.fetch(new Request(origin+"/health"),env);
   assert.equal(health.status,200);
+  assert.equal(health.headers.get("cache-control"),"no-store");
   assert.equal((await health.text()).includes(alphaSecret),false);
 });
 test("valid authorize-upload-read, repeat upload denied and tenant isolation",async()=>{
@@ -114,9 +115,11 @@ test("valid authorize-upload-read, repeat upload denied and tenant isolation",as
   const read=await worker.fetch(new Request(origin+data.mediaUrl),env);
   assert.equal(read.status,200);
   assert.equal(read.headers.get("cache-control"),"public, max-age=31536000, immutable");
+  assert.equal(read.headers.get("cache-tag"),"trigenys-storage,tenant-xeption,media-xeption-"+data.mediaId);
   assert.equal((await read.arrayBuffer()).byteLength,16);
   const foreign=await worker.fetch(new Request(origin+data.mediaUrl.replace("/xeption/","/example/")),env);
   assert.equal(foreign.status,404);
+  assert.equal(foreign.headers.get("cache-control"),"no-store");
   assert.equal((await worker.fetch(request(data.token,data.uploadUrl.replace("/xeption/","/example/")),env)).status,401);
 });
 test("invalid bytes, over-limit and missing authorization never publish media",async()=>{
