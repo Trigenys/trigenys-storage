@@ -67,3 +67,15 @@ npm install
 npm run check
 npx wrangler deploy --config wrangler.production.jsonc --dry-run
 \`\`\`
+
+## Cloudflare Workers Cache (edge-fronting, not Cache API)
+
+Public `GET /v1/media/{tenant}/{id}` responses use `Cache-Control: public, max-age=31536000, immutable`. The production Wrangler configuration enables `cache.enabled=true`, which enables **Workers Cache** in front of the Worker on `workers.dev` as well as custom domains. On a `HIT`, the Worker does not run and neither R2 nor D1 is queried. On a `MISS`, it runs and the image is cached. The cache is tiered and tied to Worker version by default; we deliberately do **not** enable cross-version caching. The cache key includes path and query, so new clients must not append arbitrary cache-busting parameters.
+
+The service adds `Cache-Tag` values `trigenys-storage`, `tenant-{tenant}` and `media-{tenant}-{id}` to support scoped invalidation before future deletion or privacy changes. A future delete endpoint **must purge the Worker cache first** (and consider browser caches, which may retain public immutable copies). Any media that may need revocation must never be served as immutable public content.
+
+Security: /health, authorization errors, missing media and all JSON API responses explicitly use `Cache-Control: no-store`; POST/PUT cannot be cached by Workers Cache. Never return private or authenticated images with public cache headers. Do not use `caches.default` here: it only reduces backend reads, not Worker invocations, and is region-local rather than tiered.
+
+Smoke test **with a real public uploaded image URL** from two separate uncached HTTP clients: request it twice (avoid request `Authorization` headers), inspect `Cf-Cache-Status` for `MISS` then `HIT`, and confirm no stale/private content is served. `HEAD` can populate the cache, but a successful GET on a fresh media URL is the stronger end-to-end test. Treat no header / `BYPASS` as unverified; note that first requests to different versions or cache keys may be `MISS`.
+
+Cloudflare documentation: https://developers.cloudflare.com/workers/cache/ ; requires Wrangler >=4.69.0. Cache hits also reduce paid Worker invocations; this is different from the low-level Cache API.

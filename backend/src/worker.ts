@@ -168,7 +168,10 @@ async function media(env: Env, tenant: string, id: string): Promise<Response> {
   if (!object) return fail("NOT_FOUND",404);
   return new Response(object.body,{status:200,headers:{
     "content-type":"image/webp",
+    // Workers Cache stores successful public media before Worker execution.
+    // Content-address-like opaque IDs are never overwritten; purge before future deletion.
     "cache-control":"public, max-age=31536000, immutable",
+    "cache-tag":"trigenys-storage,tenant-"+tenant+",media-"+tenant+"-"+id,
     "x-content-type-options":"nosniff",
     "access-control-allow-origin":"*",
     "cross-origin-resource-policy":"cross-origin"
