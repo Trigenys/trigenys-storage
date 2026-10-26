@@ -1,0 +1,134 @@
+{
+  "schemaVersion": 1,
+  "name": "Trigenys Storage",
+  "stage": "prototype",
+  "tagline": "A tenant-aware Cloudflare Worker for signed WebP uploads, private R2 objects and opaque public media links, built to serve multiple Trigenys applications.",
+  "problem": "Application teams often expose object storage directly, duplicate upload security logic or mix tenants and media identifiers. Shared media needs constrained write intents and an explicit decision before an object is publicly deliverable.",
+  "scenario": "An authenticated Xeption user requests a media upload from its trusted backend; the backend checks ownership and asks Storage for a short-lived signed upload intent. The browser uploads a bounded WebP file, then requests a public URL using an opaque media ID.",
+  "differentiation": "Tenant credentials and short-lived HMAC tokens are isolated to trusted backends, while the Worker owns generated R2 keys and D1 metadata. Public immutable reads are a deliberate visibility choice, not a generic signed private-object download.",
+  "architecture": "Xeption authenticated backend -> signed upload authorization -> Cloudflare Worker -> private R2 image + D1 tenant metadata -> public GET /v1/media/{tenant}/{id} for ready public objects. Root Node bootstrap is not the Worker runtime.",
+  "limitations": "Worker endpoints and integration contract are implemented, but this README alone cannot prove live provisioning or Xeption cutover. The current API supports public WebP only; private downloads, deletion/revocation, tenant self-service, quotas and legacy Cloudinary migration are not shipped.",
+  "capabilities": [
+    {
+      "name": "Signed WebP authorization",
+      "description": "Issue time-bounded upload intents and verify tenant/size/content restrictions.",
+      "status": "shipped",
+      "evidence": "backend/README.md"
+    },
+    {
+      "name": "Public media delivery",
+      "description": "Expose ready public R2 objects using opaque D1-backed media identifiers.",
+      "status": "shipped",
+      "evidence": "backend/src/worker.ts"
+    },
+    {
+      "name": "Xeption production cutover",
+      "description": "Validate complete upload/display flow and old Cloudinary URL coexistence before switching.",
+      "status": "in-development"
+    },
+    {
+      "name": "Private signed reads",
+      "description": "Design private media and revocation after a distinct authorization and cache invalidation model.",
+      "status": "planned"
+    }
+  ],
+  "roadmap": [
+    {
+      "name": "End-to-end tenant smoke",
+      "exitCriteria": "Test a real scoped upload, stored metadata and second-client cache read with authorization failures."
+    },
+    {
+      "name": "Legacy media compatibility",
+      "exitCriteria": "Adopt new uploads gradually while preserving existing Cloudinary assets and rollback."
+    },
+    {
+      "name": "Hardening before general availability",
+      "exitCriteria": "Add quota, operational recovery and safe revocation semantics before supporting confidential objects."
+    }
+  ],
+  "references": [
+    {
+      "name": "RAIDER Product README contract",
+      "url": "https://github.com/Trigenys/appfactory/blob/main/docs/product-readme-contract.md",
+      "relevance": "Shared immutable quality auditing without duplicating product-specific rendering."
+    }
+  ],
+  "requiredHeadings": [
+    "Why Trigenys Storage",
+    "Signed media lifecycle",
+    "Capability maturity and constraints",
+    "Architecture target",
+    "Current scaffold"
+  ],
+  "requiredTerms": [
+    "prototype",
+    "R2",
+    "D1",
+    "WebP",
+    "Worker",
+    "tenant"
+  ],
+  "requiredFiles": [
+    "backend/README.md",
+    "backend/src/worker.ts",
+    "backend/test/worker.test.ts",
+    "docs/architecture.md"
+  ],
+  "presentation": {
+    "variant": "centered",
+    "headline": "Private objects. Scoped uploads. Public media by intent.",
+    "summary": "A tenant-aware Cloudflare Worker for signed WebP uploads, private R2 objects and opaque public media links, built to serve multiple Trigenys applications.",
+    "badges": [
+      {
+        "label": "Stage",
+        "value": "Prototype",
+        "color": "orange",
+        "href": "#capability-maturity-and-constraints"
+      },
+      {
+        "label": "Storage",
+        "value": "Private R2",
+        "color": "263238",
+        "href": "#signed-media-lifecycle"
+      },
+      {
+        "label": "Registry",
+        "value": "D1",
+        "color": "0969da",
+        "href": "#signed-media-lifecycle"
+      },
+      {
+        "label": "Media",
+        "value": "WebP",
+        "color": "2563eb",
+        "href": "#capability-maturity-and-constraints"
+      }
+    ],
+    "navigation": [
+      {
+        "label": "Why",
+        "href": "#why-trigenys-storage"
+      },
+      {
+        "label": "Lifecycle",
+        "href": "#signed-media-lifecycle"
+      },
+      {
+        "label": "Limits",
+        "href": "#capability-maturity-and-constraints"
+      },
+      {
+        "label": "Architecture",
+        "href": "#architecture-target"
+      },
+      {
+        "label": "Worker",
+        "href": "backend/README.md"
+      },
+      {
+        "label": "Scaffold",
+        "href": "#current-scaffold"
+      }
+    ]
+  }
+}
