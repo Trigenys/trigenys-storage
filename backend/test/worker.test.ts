@@ -9,7 +9,7 @@ const origin = "https://storage.example.test";
 function webp(): Uint8Array {
   return new Uint8Array([82,73,70,70,8,0,0,0,87,69,66,80,86,80,56,88]);
 }
-function setup(): { env: Env; items: Map<string, Record<string, unknown>>; objects: Map<string, ArrayBuffer> } {
+function setup(options: { legacySchema?: boolean } = {}): { env: Env; items: Map<string, Record<string, unknown>>; objects: Map<string, ArrayBuffer> } {
   const items = new Map<string, Record<string, unknown>>();
   const objects = new Map<string, ArrayBuffer>();
   const DB: Env["DB"] = {
@@ -19,10 +19,24 @@ function setup(): { env: Env; items: Map<string, Record<string, unknown>>; objec
         bind(...values: unknown[]) { args = values; return statement; },
         async first<T>() {
           if (!sql.startsWith("SELECT object_key")) throw Error("unexpected select");
+          if (sql.includes("variants") && options.legacySchema) throw Error("no such column: variants");
           const item = items.get(String(args[0]));
-          return (item && item.tenant === args[1] && item.status === "ready" && item.visibility === "public" ? { object_key:item.object_key } : null) as T | null;
+          return (item && item.tenant === args[1] && item.status === "ready" && item.visibility === "public" ? { object_key:item.object_key, variants:item.variants ?? null } : null) as T | null;
         },
         async run() {
+          if (sql.startsWith("UPDATE media SET variants = COALESCE")) {
+            const [marker, id, tenant] = args;
+            const record = items.get(String(id));
+            const current = String(record?.variants ?? "");
+            if (!record || record.tenant !== tenant || record.status !== "ready" || current.includes(String(marker))) return {meta:{changes:0}};
+            record.variants = current + String(marker);
+            return {meta:{changes:1}};
+          }
+          if (sql.startsWith("UPDATE media SET variants = replace")) {
+            const record = items.get(String(args[1]));
+            if (record) record.variants = String(record.variants ?? "").replace(String(args[0]), "");
+            return {meta:{changes:record ? 1 : 0}};
+          }
           if (sql.startsWith("INSERT")) {
             const [id, tenant, folder, object_key, size] = args;
             if (items.has(String(id))) return {meta:{changes:0}};
@@ -136,4 +150,48 @@ test("invalid bytes, over-limit and missing authorization never publish media",a
   const before=await worker.fetch(new Request(origin+data.mediaUrl),env);
   assert.equal(before.status,404);
   assert.equal(objects.size,0);
+});
+async function uploaded(env: Env) {
+  const data=await (await intent(env)).json() as {mediaId:string;token:string;uploadUrl:string;mediaUrl:string};
+  const put=(route:string, token=data.token)=>worker.fetch(new Request(origin+route,{method:"PUT",
+    headers:{authorization:"Bearer "+token,"content-type":"image/webp"},body:webp().buffer as ArrayBuffer}),env);
+  return {data,put};
+}
+test("variants: upload once after the original, then served immutable",async()=>{
+  const {env,objects}=setup();
+  const {data,put}=await uploaded(env);
+  assert.equal((await put(data.uploadUrl+"/w320")).status,409);
+  assert.equal((await put(data.uploadUrl)).status,201);
+  const v=await put(data.uploadUrl+"/w320");
+  assert.equal(v.status,201);
+  assert.equal(((await v.json()) as {url:string}).url,data.mediaUrl+"/w320");
+  assert.equal((await put(data.uploadUrl+"/w320")).status,409);
+  assert.equal((await put(data.uploadUrl+"/w999")).status,404);
+  assert.ok([...objects.keys()].some((k)=>k.endsWith(data.mediaId+"@w320.webp")));
+  const read=await worker.fetch(new Request(origin+data.mediaUrl+"/w320"),env);
+  assert.equal(read.status,200);
+  assert.equal(read.headers.get("cache-control"),"public, max-age=31536000, immutable");
+});
+test("variants: missing rendition falls back to the original with a short cache",async()=>{
+  const {env}=setup();
+  const {data,put}=await uploaded(env);
+  await put(data.uploadUrl);
+  const read=await worker.fetch(new Request(origin+data.mediaUrl+"/w800"),env);
+  assert.equal(read.status,200);
+  assert.equal(read.headers.get("cache-control"),"public, max-age=300");
+  const legacy=setup({legacySchema:true});
+  const old=await uploaded(legacy.env);
+  await old.put(old.data.uploadUrl);
+  const fallback=await worker.fetch(new Request(origin+old.data.mediaUrl+"/w320"),legacy.env);
+  assert.equal(fallback.status,200);
+  const unknown=await worker.fetch(new Request(origin+"/v1/media/xeption/f5e5b0cb-0bad-4de4-8dad-e15dd77eb4d5/w320"),env);
+  assert.equal(unknown.status,404);
+});
+test("variants: foreign token or tenant cannot write a rendition",async()=>{
+  const {env}=setup();
+  const a=await uploaded(env);
+  const b=await uploaded(env);
+  await a.put(a.data.uploadUrl);
+  assert.equal((await a.put(a.data.uploadUrl+"/w320",b.data.token)).status,401);
+  assert.equal((await a.put(a.data.uploadUrl.replace("/xeption/","/example/")+"/w320")).status,401);
 });
