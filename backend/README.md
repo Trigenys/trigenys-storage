@@ -7,7 +7,7 @@ This is the **Cloudflare Worker application**. The generated Node HTTP skeleton 
 - Worker: \`trigenys-storage-api\` (provision through the repository's canonical \`.github/workflows/appfactory-infrastructure.yml\`, using AppFactory OIDC)
 - R2: private bucket \`trigenys-storage-media\`, binding \`MEDIA_BUCKET\`
 - D1: database \`trigenys-storage-registry\`, binding \`DB\`
-- D1 migration: \`migrations/0001_media_registry.sql\` (apply before traffic)
+- D1 migrations: \`migrations/0001_media_registry.sql\`, \`migrations/0002_media_variants.sql\` (apply in order before deploying the Worker)
 - Both D1 and R2 must remain private; **never** attach an R2 public domain.
 - Deployments must preserve existing Worker secrets (\`wrangler --keep-vars\`). Missing secrets cause authorization to fail closed.
 
@@ -79,3 +79,10 @@ Security: /health, authorization errors, missing media and all JSON API response
 Smoke test **with a real public uploaded image URL** from two separate uncached HTTP clients: request it twice (avoid request `Authorization` headers), inspect `Cf-Cache-Status` for `MISS` then `HIT`, and confirm no stale/private content is served. `HEAD` can populate the cache, but a successful GET on a fresh media URL is the stronger end-to-end test. Treat no header / `BYPASS` as unverified; note that first requests to different versions or cache keys may be `MISS`.
 
 Cloudflare documentation: https://developers.cloudflare.com/workers/cache/ ; requires Wrangler >=4.69.0. Cache hits also reduce paid Worker invocations; this is different from the low-level Cache API.
+
+## Resized variants (`w320`, `w800`)
+
+The Worker never resizes. After uploading the original, the client may upload smaller WebP renditions with the **same token** (within its lifetime):
+`PUT /v1/uploads/{tenant}/{id}/w320` and `/w800`. Each rendition is accepted once (409 afterwards, or before the original is ready).
+`GET /v1/media/{tenant}/{id}/w320` serves the rendition immutably; when it does not exist (older media, failed upload, unmigrated registry) it serves the original with `max-age=300`, so variant URLs are always safe to emit.
+

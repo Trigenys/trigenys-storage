@@ -24,6 +24,13 @@ const MAX_BYTES = 8 * 1024 * 1024;
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TENANT_RE = /^[a-z][a-z0-9-]{1,39}$/;
 const FOLDER_RE = /^[a-z][a-z0-9-]{0,39}$/;
+// Resized renditions uploaded by the client after the original (no server-side resizing).
+export const VARIANTS = ["w320","w800"] as const;
+type Variant = typeof VARIANTS[number];
+const isVariant = (value: string): value is Variant => (VARIANTS as readonly string[]).includes(value);
+const IMMUTABLE = "public, max-age=31536000, immutable";
+// A missing variant falls back to the original briefly: it may still be uploading.
+const FALLBACK_CACHE = "public, max-age=300";
 const textEncoder = new TextEncoder();
 function json(value: unknown, status = 200, headers: Record<string,string> = {}): Response {
   return new Response(JSON.stringify(value), {
@@ -129,7 +136,7 @@ async function readLimited(request: Request, limit: number): Promise<Uint8Array 
   for (const chunk of chunks) { all.set(chunk,offset); offset += chunk.byteLength; }
   return all;
 }
-async function upload(request: Request, env: Env, tenant: string, id: string): Promise<Response> {
+async function readUpload(request: Request, env: Env, tenant: string, id: string): Promise<{claims: TokenClaims; buffer: ArrayBuffer} | Response> {
   const auth = /^Bearer ([A-Za-z0-9_.-]+)$/.exec(request.headers.get("authorization") || "");
   const claims = auth ? await verifyToken(auth[1],env.TOKEN_SIGNING_SECRET || "") : null;
   if (!claims || claims.tenant !== tenant || claims.id !== id) return fail("UNAUTHORIZED",401);
@@ -140,7 +147,15 @@ async function upload(request: Request, env: Env, tenant: string, id: string): P
   const bytes = await readLimited(request, claims.maxBytes);
   if (!bytes || bytes.byteLength === 0) return fail("REQUEST_TOO_LARGE",413);
   if (!isWebP(bytes)) return fail("INVALID_WEBP",415);
-  const buffer = bytes.buffer as ArrayBuffer;
+  return {claims, buffer: bytes.buffer as ArrayBuffer};
+}
+function variantKey(objectKey: string, variant: Variant): string {
+  return objectKey.replace(/\.webp$/, "@"+variant+".webp");
+}
+async function upload(request: Request, env: Env, tenant: string, id: string): Promise<Response> {
+  const read = await readUpload(request, env, tenant, id);
+  if (read instanceof Response) return read;
+  const {claims, buffer} = read;
   const key = "tenants/"+tenant+"/"+claims.folder+"/"+claims.id+".webp";
   const inserted = await env.DB.prepare(
     "INSERT OR IGNORE INTO media(id, tenant, folder, object_key, status, visibility, content_type, size_bytes, created_at) VALUES(?, ?, ?, ?, 'pending', 'public', 'image/webp', ?, datetime('now'))"
@@ -164,13 +179,52 @@ async function media(env: Env, tenant: string, id: string): Promise<Response> {
     "SELECT object_key FROM media WHERE id=? AND tenant=? AND status='ready' AND visibility='public'"
   ).bind(id,tenant).first<{object_key:string}>();
   if (!record) return fail("NOT_FOUND",404);
-  const object = await env.MEDIA_BUCKET.get(record.object_key);
+  return serve(env, record.object_key, tenant, id, IMMUTABLE);
+}
+/** Same token as the original, within its lifetime; each variant can be written once. */
+async function uploadVariant(request: Request, env: Env, tenant: string, id: string, variant: Variant): Promise<Response> {
+  const read = await readUpload(request, env, tenant, id);
+  if (read instanceof Response) return read;
+  const {claims, buffer} = read;
+  const marker = ","+variant;
+  const claimed = await env.DB.prepare(
+    "UPDATE media SET variants = COALESCE(variants,'') || ? WHERE id=? AND tenant=? AND status='ready' AND instr(COALESCE(variants,''), ?) = 0"
+  ).bind(marker,id,tenant,marker).run();
+  if (claimed.meta?.changes !== 1) return fail("VARIANT_UNAVAILABLE",409);
+  const key = variantKey("tenants/"+tenant+"/"+claims.folder+"/"+id+".webp", variant);
+  try {
+    await env.MEDIA_BUCKET.put(key,buffer,{httpMetadata:{contentType:"image/webp"}});
+  } catch {
+    try {await env.DB.prepare("UPDATE media SET variants = replace(variants, ?, '') WHERE id=? AND tenant=?").bind(marker,id,tenant).run();} catch {}
+    return fail("UPLOAD_FAILED",503);
+  }
+  return json({id,tenant,url:"/v1/media/"+tenant+"/"+id+"/"+variant},201);
+}
+async function mediaVariant(env: Env, tenant: string, id: string, variant: Variant): Promise<Response> {
+  if (!TENANT_RE.test(tenant) || !ID_RE.test(id)) return fail("NOT_FOUND",404);
+  let record: {object_key:string; variants:string|null} | null;
+  try {
+    record = await env.DB.prepare(
+      "SELECT object_key, variants FROM media WHERE id=? AND tenant=? AND status='ready' AND visibility='public'"
+    ).bind(id,tenant).first<{object_key:string; variants:string|null}>();
+  } catch {
+    // Registry not migrated yet (no variants column): the original stays reachable.
+    return media(env, tenant, id);
+  }
+  if (!record) return fail("NOT_FOUND",404);
+  if ((record.variants || "").split(",").includes(variant)) {
+    return serve(env, variantKey(record.object_key, variant), tenant, id, IMMUTABLE);
+  }
+  return serve(env, record.object_key, tenant, id, FALLBACK_CACHE);
+}
+async function serve(env: Env, key: string, tenant: string, id: string, cacheControl: string): Promise<Response> {
+  const object = await env.MEDIA_BUCKET.get(key);
   if (!object) return fail("NOT_FOUND",404);
   return new Response(object.body,{status:200,headers:{
     "content-type":"image/webp",
     // Workers Cache stores successful public media before Worker execution.
     // Content-address-like opaque IDs are never overwritten; purge before future deletion.
-    "cache-control":"public, max-age=31536000, immutable",
+    "cache-control":cacheControl,
     "cache-tag":"trigenys-storage,tenant-"+tenant+",media-"+tenant+"-"+id,
     "x-content-type-options":"nosniff",
     "access-control-allow-origin":"*",
@@ -197,6 +251,14 @@ export default {
     if (uploadMatch && request.method === "PUT") return upload(request,env,uploadMatch[1],uploadMatch[2]);
     const mediaMatch = /^\/v1\/media\/([a-z][a-z0-9-]{1,39})\/([0-9a-f-]{36})$/.exec(url.pathname);
     if (mediaMatch && request.method === "GET") return media(env,mediaMatch[1],mediaMatch[2]);
+    const variantUpload = /^\/v1\/uploads\/([a-z][a-z0-9-]{1,39})\/([0-9a-f-]{36})\/(w\d{3})$/.exec(url.pathname);
+    if (variantUpload && request.method === "PUT" && isVariant(variantUpload[3])) {
+      return uploadVariant(request,env,variantUpload[1],variantUpload[2],variantUpload[3]);
+    }
+    const variantMedia = /^\/v1\/media\/([a-z][a-z0-9-]{1,39})\/([0-9a-f-]{36})\/(w\d{3})$/.exec(url.pathname);
+    if (variantMedia && request.method === "GET" && isVariant(variantMedia[3])) {
+      return mediaVariant(env,variantMedia[1],variantMedia[2],variantMedia[3]);
+    }
     return fail("NOT_FOUND",404);
   }
 };
