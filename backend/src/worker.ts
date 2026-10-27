@@ -1,3 +1,5 @@
+import { runMigrationBatch } from "./migration.ts";
+
 export interface DatabaseStatement {
   bind(...values: unknown[]): DatabaseStatement;
   first<T = Record<string, unknown>>(): Promise<T | null>;
@@ -14,6 +16,8 @@ export interface Env {
   DB: DatabaseBinding;
   TENANT_CONFIG_JSON?: string;
   TOKEN_SIGNING_SECRET?: string;
+  MIGRATION_ENABLED?: string;
+  MIGRATION_SOURCES_JSON?: string;
 }
 type Tenant = { secret: string; allowedOrigins?: string[]; maxBytes?: number };
 type TokenClaims = {
@@ -232,6 +236,11 @@ async function serve(env: Env, key: string, tenant: string, id: string, cacheCon
   }});
 }
 export default {
+  async scheduled(_event: unknown, env: Env): Promise<void> {
+    const result = await runMigrationBatch(env);
+    // Numeric summary only; never log source URLs, tenants' secrets or URLs.
+    console.log('Storage migration', JSON.stringify(result));
+  },
   async fetch(request: Request,env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS" && (url.pathname.startsWith("/v1/uploads/"))) {
