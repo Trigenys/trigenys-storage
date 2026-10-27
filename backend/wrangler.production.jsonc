@@ -22,5 +22,10 @@
   },
   "cache": {
     "enabled": true
+  },
+  "triggers": {
+    "crons": [
+      "*/15 * * * *"
+    ]
   }
 }
