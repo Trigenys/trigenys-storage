@@ -1,3 +1,5 @@
+> **Status 2026-10-28 — disabled/superseded:** the three pilot queue entries failed with MIGRATION_ERROR and copied nothing. An independent, reusable migration script already exists in EagleFox31/xeption237 (`scripts/migrate-cloudinary-to-r2.mjs`), and most catalog records are already pointing to R2. The Worker secret MIGRATION_ENABLED=false and Wrangler triggers.crons=[] disable this duplicate path, including on redeploy. Do not reactivate without a scoped RAIDER review. Keep the D1 queue records for diagnosis. Use Xeption's canonical script with dry run, manifest, rollback and explicit checks for remaining assets. Never run both migrators concurrently.
+
 # Historical Cloudinary backfill — controlled pilot
 
 **Scope:** public product **images only**; not videos, troc customer uploads, private data or Cloudinary account deletions.
