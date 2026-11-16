@@ -16,6 +16,8 @@ export interface Env {
   MEDIA_BUCKET: BucketBinding;
   DB: DatabaseBinding;
   TENANT_CONFIG_JSON?: string;
+  /** Non-secret tenant map, versioned in the Worker config: end-user (Firebase) tenants only. */
+  END_USER_TENANTS_JSON?: string;
   TOKEN_SIGNING_SECRET?: string;
   MIGRATION_ENABLED?: string;
   MIGRATION_SOURCES_JSON?: string;
@@ -67,12 +69,23 @@ function decode(text: string): Uint8Array {
   const binary = atob(text.replace(/-/g, "+").replace(/_/g, "/"));
   return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
-function tenants(env: Env): Record<string, Tenant> {
+function parseTenantMap(raw: string | undefined): Record<string, Tenant> {
   try {
-    const data: unknown = JSON.parse(env.TENANT_CONFIG_JSON || "{}");
+    const data: unknown = JSON.parse(raw || "{}");
     if (!data || Array.isArray(data) || typeof data !== "object") return {};
     return data as Record<string, Tenant>;
   } catch { return {}; }
+}
+function tenants(env: Env): Record<string, Tenant> {
+  const secretTenants = parseTenantMap(env.TENANT_CONFIG_JSON);
+  const merged: Record<string, Tenant> = { ...secretTenants };
+  // Public entries never carry a secret and never override a secret-configured tenant.
+  for (const [name, tenant] of Object.entries(parseTenantMap(env.END_USER_TENANTS_JSON))) {
+    if (Object.hasOwn(secretTenants, name) || !tenant || typeof tenant !== "object") continue;
+    if ("secret" in tenant || !isFirebaseConfig(tenant.auth)) continue;
+    merged[name] = tenant;
+  }
+  return merged;
 }
 async function hmac(message: string, secret: string): Promise<string> {
   const key = await crypto.subtle.importKey("raw", textEncoder.encode(secret), {

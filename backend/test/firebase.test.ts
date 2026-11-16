@@ -172,3 +172,20 @@ test("backend tenants are unchanged, even before migration 0004", async () => {
   // A wrong secret on a Firebase tenant is not silently downgraded to token auth.
   assert.equal((await authorize(env, { "x-tenant-secret": "wrong", authorization: "Bearer " + await idToken("u1") })).status, 401);
 });
+
+test("END_USER_TENANTS_JSON adds Firebase tenants without secrets and cannot override secret tenants", async () => {
+  const { env } = setup();
+  const loveink = (JSON.parse(env.TENANT_CONFIG_JSON!) as Record<string, unknown>).loveink;
+  env.TENANT_CONFIG_JSON = JSON.stringify({ xeption: { secret: xeptionSecret } });
+  env.END_USER_TENANTS_JSON = JSON.stringify({
+    loveink,
+    xeption: { auth: { type: "firebase", projectId } },
+    leaky: { secret: "public-secret-abcdefghijklmnopqrstuvwxyz", auth: { type: "firebase", projectId } },
+    plain: { maxBytes: 1000 }
+  });
+  assert.equal((await authorize(env, { authorization: "Bearer " + await idToken("u1") })).status, 201);
+  assert.equal((await authorize(env, { authorization: "Bearer " + await idToken("u1") }, "xeption")).status, 401);
+  assert.equal((await authorize(env, { "x-tenant-secret": xeptionSecret }, "xeption")).status, 201);
+  assert.equal((await authorize(env, { "x-tenant-secret": "public-secret-abcdefghijklmnopqrstuvwxyz" }, "leaky")).status, 401);
+  assert.equal((await authorize(env, { authorization: "Bearer " + await idToken("u1") }, "plain")).status, 401);
+});

@@ -115,3 +115,5 @@ For applications without a trusted backend (static Firebase Hosting sites), a te
 - `DELETE /v1/media/{tenant}/{id}` — owner or moderator, idempotent (`204`); removes the original and its variants from R2.
 - Moderator check: the role document is read from Firestore **with the caller's own token**, so the tenant's Firestore security rules apply; the Worker holds no Google credential. Any failure means "not a moderator".
 - Cache caveat: published media are cached with `publicCacheControl` (bounded, e.g. 24 h). A withdrawn or deleted public image may stay in edge/browser caches until it expires; purge by tag would require a Cloudflare API token (future work).
+
+Firebase tenants hold no secret, so they can also be declared in the non-secret Worker variable `END_USER_TENANTS_JSON` (versioned in `wrangler.production.jsonc`, same shape). Entries there are ignored if they contain `secret`, lack a valid `auth` block, or reuse a tenant name from `TENANT_CONFIG_JSON`, so secret tenants can never be overridden or downgraded.

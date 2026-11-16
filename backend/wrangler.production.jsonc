@@ -17,6 +17,9 @@
       "migrations_dir": "migrations"
     }
   ],
+  "vars": {
+    "END_USER_TENANTS_JSON": "{\"loveink\":{\"auth\":{\"type\":\"firebase\",\"projectId\":\"love-ink\",\"requireVerifiedEmail\":false,\"roles\":{\"document\":\"utilisateurs/{uid}\",\"field\":\"role\",\"moderator\":[\"moderateur\",\"censeur\"]}},\"uploadVisibility\":\"private\",\"maxPendingPerSubject\":20,\"publicCacheControl\":\"public, max-age=86400\",\"maxBytes\":1500000}}"
+  },
   "observability": {
     "enabled": true
   },
