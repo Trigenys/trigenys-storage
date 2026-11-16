@@ -1,4 +1,5 @@
 import { runMigrationBatch } from "./migration.ts";
+import { bearer, isFirebaseConfig, isModerator, verifyFirebaseToken, type FirebaseAuthConfig, type FirebaseUser } from "./firebaseAuth.ts";
 
 export interface DatabaseStatement {
   bind(...values: unknown[]): DatabaseStatement;
@@ -19,10 +20,21 @@ export interface Env {
   MIGRATION_ENABLED?: string;
   MIGRATION_SOURCES_JSON?: string;
 }
-type Tenant = { secret: string; allowedOrigins?: string[]; maxBytes?: number };
+type Tenant = {
+  secret?: string; allowedOrigins?: string[]; maxBytes?: number;
+  /** End-user auth for tenants without a trusted backend (see firebaseAuth.ts). */
+  auth?: FirebaseAuthConfig;
+  /** Visibility of end-user uploads. "private" keeps media hidden until a moderator publishes it. */
+  uploadVisibility?: "public" | "private";
+  /** Cap on private (unpublished) media per end user. Default 20. */
+  maxPendingPerSubject?: number;
+  /** Cache-Control for public media. Default immutable; use a bounded max-age when media may be revoked. */
+  publicCacheControl?: string;
+};
+type Visibility = "public" | "private";
 type TokenClaims = {
   v: 1; scope: "upload"; tenant: string; id: string; folder: string;
-  contentType: "image/webp"; maxBytes: number; visibility: "public"; exp: number;
+  contentType: "image/webp"; maxBytes: number; visibility: Visibility; exp: number; sub?: string;
 };
 const MAX_BYTES = 8 * 1024 * 1024;
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -39,7 +51,7 @@ const textEncoder = new TextEncoder();
 function json(value: unknown, status = 200, headers: Record<string,string> = {}): Response {
   return new Response(JSON.stringify(value), {
     status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store",
-      "x-content-type-options": "nosniff", ...headers }
+      "x-content-type-options": "nosniff", "access-control-allow-origin": "*", ...headers }
   });
 }
 function fail(message: string, status: number): Response {
@@ -90,7 +102,8 @@ export async function verifyToken(token: string, secret: string, now = Math.floo
     const claims = JSON.parse(new TextDecoder().decode(decode(parts[0]))) as TokenClaims;
     if (claims.v !== 1 || claims.scope !== "upload" || !TENANT_RE.test(claims.tenant)
       || !ID_RE.test(claims.id) || !FOLDER_RE.test(claims.folder)
-      || claims.contentType !== "image/webp" || claims.visibility !== "public"
+      || claims.contentType !== "image/webp" || (claims.visibility !== "public" && claims.visibility !== "private")
+      || (claims.sub !== undefined && (typeof claims.sub !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(claims.sub)))
       || !Number.isSafeInteger(claims.maxBytes) || claims.maxBytes < 1 || claims.maxBytes > MAX_BYTES
       || !Number.isSafeInteger(claims.exp) || claims.exp < now || claims.exp > now+300) return null;
     return claims;
@@ -111,15 +124,34 @@ async function authorize(request: Request, env: Env): Promise<Response> {
   const folder = body.folder;
   if (typeof tenant !== "string" || !TENANT_RE.test(tenant) || typeof folder !== "string" || !FOLDER_RE.test(folder)) return fail("INVALID_REQUEST",400);
   const client = tenants(env)[tenant];
-  if (!client || !client.secret || client.secret.length < 32 ||
-    !(await equalSecrets(request.headers.get("x-tenant-secret") || "", client.secret))) return fail("UNAUTHORIZED",401);
+  if (!client) return fail("UNAUTHORIZED",401);
+  // Trusted backend (tenant secret) or, when configured, the end user's own ID token.
+  let user: FirebaseUser | null = null;
+  const secretHeader = request.headers.get("x-tenant-secret");
+  if (secretHeader !== null || !client.auth) {
+    if (!client.secret || client.secret.length < 32 || !(await equalSecrets(secretHeader || "", client.secret))) return fail("UNAUTHORIZED",401);
+  } else {
+    const idToken = bearer(request);
+    user = idToken && isFirebaseConfig(client.auth) ? await verifyFirebaseToken(idToken, client.auth) : null;
+    if (!user) return fail("UNAUTHORIZED",401);
+  }
   if (body.contentType !== "image/webp") return fail("UNSUPPORTED_MEDIA_TYPE",415);
   const maxAllowed = Math.min(MAX_BYTES, Number.isSafeInteger(client.maxBytes) && (client.maxBytes as number)>0 ? client.maxBytes as number : MAX_BYTES);
   if (!Number.isSafeInteger(body.maxBytes) || (body.maxBytes as number) < 1 || (body.maxBytes as number) > maxAllowed) return fail("INVALID_SIZE",400);
-  const claims: TokenClaims = {v:1,scope:"upload",tenant,id:crypto.randomUUID(),folder,contentType:"image/webp",maxBytes:body.maxBytes as number,visibility:"public",exp:Math.floor(Date.now()/1000)+180};
+  const visibility: Visibility = user && client.uploadVisibility !== "public" ? "private" : "public";
+  if (user && visibility === "private") {
+    const limit = Number.isSafeInteger(client.maxPendingPerSubject) && (client.maxPendingPerSubject as number) > 0 ? client.maxPendingPerSubject as number : 20;
+    const pending = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM media WHERE tenant=? AND owner_subject=? AND visibility='private' AND status<>'deleted'"
+    ).bind(tenant,user.subject).first<{n:number}>().catch(() => null);
+    if (!pending) return fail("STORAGE_UNAVAILABLE",503);
+    if (Number(pending.n) >= limit) return fail("PENDING_LIMIT_REACHED",429);
+  }
+  const claims: TokenClaims = {v:1,scope:"upload",tenant,id:crypto.randomUUID(),folder,contentType:"image/webp",maxBytes:body.maxBytes as number,visibility,exp:Math.floor(Date.now()/1000)+180};
+  if (user) claims.sub = user.subject;
   const token = await signToken(claims, env.TOKEN_SIGNING_SECRET);
   return json({token,mediaId:claims.id,uploadUrl:"/v1/uploads/"+tenant+"/"+claims.id,
-    mediaUrl:"/v1/media/"+tenant+"/"+claims.id,expiresAt:new Date(claims.exp*1000).toISOString()},201);
+    mediaUrl:"/v1/media/"+tenant+"/"+claims.id,visibility,expiresAt:new Date(claims.exp*1000).toISOString()},201);
 }
 async function readLimited(request: Request, limit: number): Promise<Uint8Array | null> {
   if (!request.body) return null;
@@ -161,9 +193,14 @@ async function upload(request: Request, env: Env, tenant: string, id: string): P
   if (read instanceof Response) return read;
   const {claims, buffer} = read;
   const key = "tenants/"+tenant+"/"+claims.folder+"/"+claims.id+".webp";
-  const inserted = await env.DB.prepare(
-    "INSERT OR IGNORE INTO media(id, tenant, folder, object_key, status, visibility, content_type, size_bytes, created_at) VALUES(?, ?, ?, ?, 'pending', 'public', 'image/webp', ?, datetime('now'))"
-  ).bind(id,tenant,claims.folder,key,buffer.byteLength).run();
+  // Backend-authorized public uploads keep the original statement (no dependency on migration 0004).
+  const inserted = await (claims.sub === undefined && claims.visibility === "public"
+    ? env.DB.prepare(
+      "INSERT OR IGNORE INTO media(id, tenant, folder, object_key, status, visibility, content_type, size_bytes, created_at) VALUES(?, ?, ?, ?, 'pending', 'public', 'image/webp', ?, datetime('now'))"
+    ).bind(id,tenant,claims.folder,key,buffer.byteLength)
+    : env.DB.prepare(
+      "INSERT OR IGNORE INTO media(id, tenant, folder, object_key, size_bytes, visibility, owner_subject, status, content_type, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', 'image/webp', datetime('now'))"
+    ).bind(id,tenant,claims.folder,key,buffer.byteLength,claims.visibility,claims.sub ?? null)).run();
   if (inserted.meta?.changes !== 1) return fail("TOKEN_ALREADY_USED",409);
   try {
     await env.MEDIA_BUCKET.put(key,buffer,{httpMetadata:{contentType:"image/webp"}});
@@ -177,13 +214,67 @@ async function upload(request: Request, env: Env, tenant: string, id: string): P
   }
   return json({id,tenant,url:"/v1/media/"+tenant+"/"+id},201);
 }
-async function media(env: Env, tenant: string, id: string): Promise<Response> {
+function publicCache(env: Env, tenant: string): string {
+  const value = tenants(env)[tenant]?.publicCacheControl;
+  return typeof value === "string" && /^public, max-age=\d{1,8}(, immutable)?$/.test(value) ? value : IMMUTABLE;
+}
+async function media(env: Env, tenant: string, id: string, request?: Request): Promise<Response> {
   if (!TENANT_RE.test(tenant) || !ID_RE.test(id)) return fail("NOT_FOUND",404);
   const record = await env.DB.prepare(
     "SELECT object_key FROM media WHERE id=? AND tenant=? AND status='ready' AND visibility='public'"
   ).bind(id,tenant).first<{object_key:string}>();
-  if (!record) return fail("NOT_FOUND",404);
-  return serve(env, record.object_key, tenant, id, IMMUTABLE);
+  if (!record) return request && bearer(request) ? privateMedia(request, env, tenant, id) : fail("NOT_FOUND",404);
+  return serve(env, record.object_key, tenant, id, publicCache(env, tenant));
+}
+type OwnedRecord = { object_key: string; owner_subject: string | null; visibility: Visibility; status: string };
+/** Authenticates the end user and loads the record: owner or moderator only; 404 otherwise, to hide existence. */
+async function authorizeMedia(request: Request, env: Env, tenant: string, id: string,
+  options: { moderatorOnly?: boolean; includeDeleted?: boolean } = {}): Promise<OwnedRecord | Response> {
+  if (!TENANT_RE.test(tenant) || !ID_RE.test(id)) return fail("NOT_FOUND",404);
+  const config = tenants(env)[tenant]?.auth;
+  const token = bearer(request);
+  if (!config || !isFirebaseConfig(config) || !token) return fail("UNAUTHORIZED",401);
+  const user = await verifyFirebaseToken(token, config);
+  if (!user) return fail("UNAUTHORIZED",401);
+  let record: OwnedRecord | null;
+  try {
+    record = await env.DB.prepare(
+      "SELECT object_key, owner_subject, visibility, status FROM media WHERE id=? AND tenant=? AND status IN ('ready','deleted')"
+    ).bind(id,tenant).first<OwnedRecord>();
+  } catch { return fail("STORAGE_UNAVAILABLE",503); }
+  if (!record || (record.status === "deleted" && !options.includeDeleted)) return fail("NOT_FOUND",404);
+  const owner = record.owner_subject !== null && record.owner_subject === user.subject;
+  if ((options.moderatorOnly || !owner) && !(await isModerator(user, config))) return fail("NOT_FOUND",404);
+  return record;
+}
+async function privateMedia(request: Request, env: Env, tenant: string, id: string): Promise<Response> {
+  const record = await authorizeMedia(request, env, tenant, id);
+  if (record instanceof Response) return record;
+  return serve(env, record.object_key, tenant, id, "private, no-store");
+}
+/** Moderator decision: publish ("public") or withdraw ("private"). Idempotent. */
+async function setVisibility(request: Request, env: Env, tenant: string, id: string): Promise<Response> {
+  if (Number(request.headers.get("content-length") || "0") > 256) return fail("REQUEST_TOO_LARGE",413);
+  let body: { visibility?: unknown };
+  try { body = await request.json() as typeof body; } catch { return fail("INVALID_JSON",400); }
+  if (body.visibility !== "public" && body.visibility !== "private") return fail("INVALID_REQUEST",400);
+  const record = await authorizeMedia(request, env, tenant, id, { moderatorOnly: true });
+  if (record instanceof Response) return record;
+  if (record.visibility !== body.visibility) {
+    await env.DB.prepare("UPDATE media SET visibility=? WHERE id=? AND tenant=? AND status='ready'").bind(body.visibility,id,tenant).run();
+  }
+  return json({id,tenant,visibility:body.visibility});
+}
+/** Owner or moderator. Idempotent: retrying a deletion re-attempts object removal. */
+async function removeMedia(request: Request, env: Env, tenant: string, id: string): Promise<Response> {
+  const record = await authorizeMedia(request, env, tenant, id, { includeDeleted: true });
+  if (record instanceof Response) return record;
+  if (record.status !== "deleted") {
+    await env.DB.prepare("UPDATE media SET status='deleted', visibility='private', deleted_at=datetime('now') WHERE id=? AND tenant=?").bind(id,tenant).run();
+  }
+  const keys = [record.object_key, ...VARIANTS.map((v) => variantKey(record.object_key, v))];
+  try { for (const key of keys) await env.MEDIA_BUCKET.delete(key); } catch { return fail("DELETE_INCOMPLETE",503); }
+  return new Response(null,{status:204,headers:{"cache-control":"no-store","access-control-allow-origin":"*"}});
 }
 /** Same token as the original, within its lifetime; each variant can be written once. */
 async function uploadVariant(request: Request, env: Env, tenant: string, id: string, variant: Variant): Promise<Response> {
@@ -204,7 +295,7 @@ async function uploadVariant(request: Request, env: Env, tenant: string, id: str
   }
   return json({id,tenant,url:"/v1/media/"+tenant+"/"+id+"/"+variant},201);
 }
-async function mediaVariant(env: Env, tenant: string, id: string, variant: Variant): Promise<Response> {
+async function mediaVariant(env: Env, tenant: string, id: string, variant: Variant, request?: Request): Promise<Response> {
   if (!TENANT_RE.test(tenant) || !ID_RE.test(id)) return fail("NOT_FOUND",404);
   let record: {object_key:string; variants:string|null} | null;
   try {
@@ -215,9 +306,10 @@ async function mediaVariant(env: Env, tenant: string, id: string, variant: Varia
     // Registry not migrated yet (no variants column): the original stays reachable.
     return media(env, tenant, id);
   }
-  if (!record) return fail("NOT_FOUND",404);
+  // Unpublished media: the original only, for its owner or a moderator.
+  if (!record) return request && bearer(request) ? privateMedia(request, env, tenant, id) : fail("NOT_FOUND",404);
   if ((record.variants || "").split(",").includes(variant)) {
-    return serve(env, variantKey(record.object_key, variant), tenant, id, IMMUTABLE);
+    return serve(env, variantKey(record.object_key, variant), tenant, id, publicCache(env, tenant));
   }
   return serve(env, record.object_key, tenant, id, FALLBACK_CACHE);
 }
@@ -243,9 +335,9 @@ export default {
   },
   async fetch(request: Request,env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method === "OPTIONS" && (url.pathname.startsWith("/v1/uploads/"))) {
+    if (request.method === "OPTIONS" && (url.pathname.startsWith("/v1/uploads/") || url.pathname.startsWith("/v1/media/"))) {
       return new Response(null,{status:204,headers:{
-        "access-control-allow-origin":"*","access-control-allow-methods":"PUT, OPTIONS",
+        "access-control-allow-origin":"*","access-control-allow-methods":"GET, POST, PUT, DELETE, OPTIONS",
         "access-control-allow-headers":"Authorization, Content-Type",
         "access-control-max-age":"600","vary":"origin"
       }});
@@ -259,14 +351,17 @@ export default {
     const uploadMatch = /^\/v1\/uploads\/([a-z][a-z0-9-]{1,39})\/([0-9a-f-]{36})$/.exec(url.pathname);
     if (uploadMatch && request.method === "PUT") return upload(request,env,uploadMatch[1],uploadMatch[2]);
     const mediaMatch = /^\/v1\/media\/([a-z][a-z0-9-]{1,39})\/([0-9a-f-]{36})$/.exec(url.pathname);
-    if (mediaMatch && request.method === "GET") return media(env,mediaMatch[1],mediaMatch[2]);
+    if (mediaMatch && request.method === "GET") return media(env,mediaMatch[1],mediaMatch[2],request);
+    if (mediaMatch && request.method === "DELETE") return removeMedia(request,env,mediaMatch[1],mediaMatch[2]);
+    const visibilityMatch = /^\/v1\/media\/([a-z][a-z0-9-]{1,39})\/([0-9a-f-]{36})\/visibility$/.exec(url.pathname);
+    if (visibilityMatch && request.method === "POST") return setVisibility(request,env,visibilityMatch[1],visibilityMatch[2]);
     const variantUpload = /^\/v1\/uploads\/([a-z][a-z0-9-]{1,39})\/([0-9a-f-]{36})\/(w\d{3})$/.exec(url.pathname);
     if (variantUpload && request.method === "PUT" && isVariant(variantUpload[3])) {
       return uploadVariant(request,env,variantUpload[1],variantUpload[2],variantUpload[3]);
     }
     const variantMedia = /^\/v1\/media\/([a-z][a-z0-9-]{1,39})\/([0-9a-f-]{36})\/(w\d{3})$/.exec(url.pathname);
     if (variantMedia && request.method === "GET" && isVariant(variantMedia[3])) {
-      return mediaVariant(env,variantMedia[1],variantMedia[2],variantMedia[3]);
+      return mediaVariant(env,variantMedia[1],variantMedia[2],variantMedia[3],request);
     }
     return fail("NOT_FOUND",404);
   }
