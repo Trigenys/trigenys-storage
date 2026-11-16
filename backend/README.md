@@ -7,7 +7,7 @@ This is the **Cloudflare Worker application**. The generated Node HTTP skeleton 
 - Worker: \`trigenys-storage-api\` (provision through the repository's canonical \`.github/workflows/appfactory-infrastructure.yml\`, using AppFactory OIDC)
 - R2: private bucket \`trigenys-storage-media\`, binding \`MEDIA_BUCKET\`
 - D1: database \`trigenys-storage-registry\`, binding \`DB\`
-- D1 migrations: \`migrations/0001_media_registry.sql\`, \`migrations/0002_media_variants.sql\` (apply in order before deploying the Worker)
+- D1 migrations: `migrations/0001_media_registry.sql`, `0002_media_variants.sql`, `0003_cloudinary_migration_queue.sql`, `0004_end_user_ownership.sql` (apply in order before deploying the Worker; 0004 is additive and only required by tenants using end-user auth)
 - Both D1 and R2 must remain private; **never** attach an R2 public domain.
 - Deployments must preserve existing Worker secrets (\`wrangler --keep-vars\`). Missing secrets cause authorization to fail closed.
 
@@ -86,3 +86,32 @@ The Worker never resizes. After uploading the original, the client may upload sm
 `PUT /v1/uploads/{tenant}/{id}/w320` and `/w800`. Each rendition is accepted once (409 afterwards, or before the original is ready).
 `GET /v1/media/{tenant}/{id}/w320` serves the rendition immutably; when it does not exist (older media, failed upload, unmigrated registry) it serves the original with `max-age=300`, so variant URLs are always safe to emit.
 
+
+## End-user tenants (Firebase Authentication)
+
+For applications without a trusted backend (static Firebase Hosting sites), a tenant may authenticate its **end users** directly with Firebase ID tokens instead of a server secret. Configured per tenant in `TENANT_CONFIG_JSON`, no fork:
+
+```json
+{
+  "loveink": {
+    "auth": {
+      "type": "firebase",
+      "projectId": "love-ink",
+      "requireVerifiedEmail": false,
+      "roles": { "document": "utilisateurs/{uid}", "field": "role", "moderator": ["moderateur", "censeur"] }
+    },
+    "uploadVisibility": "private",
+    "maxPendingPerSubject": 20,
+    "publicCacheControl": "public, max-age=86400",
+    "maxBytes": 1500000
+  }
+}
+```
+
+- `POST /v1/uploads/authorize` with `Authorization: Bearer <Firebase ID token>`. The token is verified (RS256, Google key set, issuer `https://securetoken.google.com/<projectId>`, audience, expiry, subject; verified e-mail unless `requireVerifiedEmail: false`). A request carrying `X-Tenant-Secret` always uses the secret path and is never downgraded.
+- Uploads are **private** and owned by the token subject (`owner_subject`) until a moderator publishes them. `maxPendingPerSubject` (default 20) caps private media per user (`429 PENDING_LIMIT_REACHED`).
+- `GET /v1/media/{tenant}/{id}[/w320|/w800]` with a bearer token serves private media to its owner or a moderator, `Cache-Control: private, no-store`. Anyone else gets `404`.
+- `POST /v1/media/{tenant}/{id}/visibility` `{"visibility":"public"|"private"}` — moderators only, idempotent.
+- `DELETE /v1/media/{tenant}/{id}` — owner or moderator, idempotent (`204`); removes the original and its variants from R2.
+- Moderator check: the role document is read from Firestore **with the caller's own token**, so the tenant's Firestore security rules apply; the Worker holds no Google credential. Any failure means "not a moderator".
+- Cache caveat: published media are cached with `publicCacheControl` (bounded, e.g. 24 h). A withdrawn or deleted public image may stay in edge/browser caches until it expires; purge by tag would require a Cloudflare API token (future work).
